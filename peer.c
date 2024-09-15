@@ -11,9 +11,9 @@
 #include<poll.h>
 #include <stdbool.h>
 
-#define MAX_NO_HOSTS 5
-#define ACK_PORT "8081"
-#define BEAT_PORT "8080"
+#define MAX_NO_HOSTS 1
+#define ACK_PORT "8080"
+#define BEAT_PORT "8081"
 
 struct sock {
 
@@ -46,13 +46,13 @@ void bind_socket(char *host, char *port, struct sock* s) {
 	for(p = servinfo; p != NULL; p = p->ai_next) {
 		if ((sockfd = socket(p->ai_family, p->ai_socktype,
 				p->ai_protocol)) == -1) {
-			perror("listener: socket");
+			perror("peer: socket");
 			continue;
 		}
 
 		if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
 			close(sockfd);
-			perror("listener: bind");
+			perror("peer: bind");
 			continue;
 		}
 
@@ -60,7 +60,7 @@ void bind_socket(char *host, char *port, struct sock* s) {
 	}
 
 	if (p == NULL) {
-		fprintf(stderr, "listener: failed to bind socket\n");
+		fprintf(stderr, "peer: failed to bind socket\n");
 	}
 
     s->sockfd = sockfd;
@@ -111,7 +111,7 @@ struct sock * getsock(struct sock **sockets, int sockfd) {
 int getindex(struct sock **sockets, struct sock* socket) {
 
     for (int i = 0; i < MAX_NO_HOSTS; i++) {
-        if (strcmp(sockets[i]->servinfo->ai_addr->sa_data,socket->servinfo->ai_addr->sa_data) == 0)
+        if (strcmp(sockets[i]->servinfo->ai_addr->sa_data, socket->servinfo->ai_addr->sa_data) == 0)
             return i;
     }
 
@@ -156,23 +156,25 @@ int main(int argc, char *argv[]) {
     struct sock **sack_sockets = malloc(sizeof(struct sock *) * MAX_NO_HOSTS); 
     
     for (int i = 0; i < MAX_NO_HOSTS; i++) {
+        sbeat_sockets[i] = malloc(sizeof(struct sock));
         bind_socket(hosts[i], BEAT_PORT, sbeat_sockets[i]);
         pfds[i].fd = sbeat_sockets[i]->sockfd;
         pfds[i].events = POLL_OUT;
     }
 
     for (int i = MAX_NO_HOSTS; i < 2 * MAX_NO_HOSTS; i++) {
+        sack_sockets[i-MAX_NO_HOSTS] = malloc(sizeof(struct sock));
         bind_socket(hosts[i-MAX_NO_HOSTS], ACK_PORT, sack_sockets[i-MAX_NO_HOSTS]);
-        pfds[i].fd = sack_sockets[i]->sockfd;
+        pfds[i].fd = sack_sockets[i-MAX_NO_HOSTS]->sockfd;
         pfds[i].events = POLL_OUT;
     }
 
-    struct sock *rbeat_socket = malloc(sizeof(struct sock *));
+    struct sock *rbeat_socket = malloc(sizeof(struct sock));
     bind_socket(NULL, BEAT_PORT, rbeat_socket);
     pfds[2*MAX_NO_HOSTS].fd = rbeat_socket->sockfd;
     pfds[2*MAX_NO_HOSTS].events = POLL_IN;
 
-    struct sock *rack_socket = malloc(sizeof(struct sock *));
+    struct sock *rack_socket = malloc(sizeof(struct sock));
     bind_socket(NULL, ACK_PORT, rack_socket);
     pfds[2*MAX_NO_HOSTS+1].fd = rack_socket->sockfd;
     pfds[2*MAX_NO_HOSTS+1].events = POLL_IN;
@@ -200,6 +202,7 @@ int main(int argc, char *argv[]) {
 
                     int index = getindex(sack_sockets, rack_socket);
                     if (!rack[index]) {
+                        fprintf(stderr, "Received acknowledgement from %s\n", hosts[index]);
                         rack[index] = true;
                         ack_count++;
                     }
@@ -212,6 +215,7 @@ int main(int argc, char *argv[]) {
                     
                     int index = getindex(sbeat_sockets, rbeat_socket);
                     if (!rbeat[index]) {
+                        fprintf(stderr, "Received heartbeat from %s\n", hosts[index]);
                         rbeat[index] = true;
                         recv_count++;
                     }
@@ -234,6 +238,7 @@ int main(int argc, char *argv[]) {
                     int index = getindex(sack_sockets, sack_socket);
                      
                     if (rbeat[index]) {
+                        fprintf(stderr, "Sending acknowledgement to %s\n", hosts[index]);
                         if (sendto(sack_socket->sockfd, ack_msg, strlen(ack_msg), 0, sack_socket->servinfo->ai_addr, sack_socket->servinfo->ai_addrlen) == -1) {
                             perror("peer: sendto");
                         } 
