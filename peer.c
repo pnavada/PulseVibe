@@ -1,19 +1,31 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include<poll.h>
+#include <errno.h>
+#include <netdb.h>
 #include <stdbool.h>
+#include<poll.h>
 
-#define MAX_NO_HOSTS 1
-#define ACK_PORT "8080"
-#define BEAT_PORT "8081"
+
+#define MAXBUFLEN 100
+#define max(x, y) (((x) > (y)) ? (x) : (y))
+#define MAX_NO_HOSTS 4
+
+
+void *get_in_addr(struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        return &(((struct sockaddr_in*)sa)->sin_addr);
+    }
+
+    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
 
 struct sock {
 
@@ -24,7 +36,132 @@ struct sock {
 
 };
 
-void bind_socket(char *host, char *port, struct sock* s) {
+
+bool compare_addr(struct addrinfo *ai, struct sockaddr_storage *ss) {
+
+        struct sockaddr_in *addr1 = (struct sockaddr_in *)ai->ai_addr;
+        struct sockaddr_in *addr2 = (struct sockaddr_in *)ss;
+        
+        return (addr1->sin_addr.s_addr == addr2->sin_addr.s_addr);
+}
+
+int get_index(struct sock ** sockets, int n, struct sockaddr_storage *ss) {
+
+    //printf("n: %d\n", n);
+
+    for (int i = 0; i < n; i++) {
+        if (compare_addr(sockets[i]->servinfo, ss)) {
+           // printf("Hello\n");
+            return i;
+        }
+    }
+
+    return -1;
+
+}
+
+
+void get_hosts(char *file, char ** hosts, int *n) {
+
+    FILE *fp;
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t n_chars;
+    int i = 0;
+    // Read the host name
+    char hostname[128];
+    gethostname(hostname, sizeof hostname);
+    printf("My hostname: %s\n", hostname);
+
+    fp = fopen(file, "r");
+    if (fp == NULL) {
+        fprintf(stderr, "Error opening file %s\n", file);
+        return;
+    }
+
+    while ((n_chars = getline(&line, &len, fp)) != -1) {
+        // Remove newline character if present
+        if (n_chars > 0 && line[n_chars - 1] == '\n') {
+            line[n_chars - 1] = '\0';
+            n_chars--;
+        }
+
+        // printf("Read line: %s (length: %zd)\n", line, n_chars);
+
+        if (strcmp(line, hostname) != 0) { // No need to send heartbeats to running host
+            hosts[i] = malloc((n_chars + 1) * sizeof(char));  // +1 for null terminator
+            if (hosts[i] == NULL) {
+                fprintf(stderr, "Memory allocation failed\n");
+                continue;
+            }
+            strncpy(hosts[i], line, n_chars);
+            hosts[i][n_chars] = '\0';  // Ensure null-termination
+            // printf("Added host: %s\n", hosts[i]);
+            i++;
+        }
+    }
+
+    *n = i;
+
+    fclose(fp);
+
+    free(line);  // Free the line buffer allocated by getline
+
+}
+
+
+void bind_socket(char *port, struct sock* s) {
+    
+    int sockfd;
+	struct addrinfo hints, *servinfo, *p;
+	int rv;
+
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_INET; // set to AF_INET to use IPv4
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_flags = AI_PASSIVE; // use my IP
+
+	if ((rv = getaddrinfo(NULL, port, &hints, &servinfo)) != 0) {
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        return;
+	}
+
+	// loop through all the results and bind to the first we can
+	for(p = servinfo; p != NULL; p = p->ai_next) {
+		if ((sockfd = socket(p->ai_family, p->ai_socktype,
+				p->ai_protocol)) == -1) {
+			perror("peer: socket");
+			continue;
+        }
+        // char ip[INET_ADDRSTRLEN];
+        // printf("%d", sockfd);
+        // printf("%d\n", p->ai_family);
+        // struct sockaddr_in *sin = (struct sockaddr_in *)p->ai_addr;
+        // inet_ntop(AF_INET, &(sin->sin_addr), ip, INET_ADDRSTRLEN);
+        // printf("%s\n", ip);
+
+		if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+			close(sockfd);
+			perror("peer: bind");
+			continue;
+		}
+
+		break;
+	}
+
+	if (p == NULL) {
+		fprintf(stderr, "peer: failed to bind socket\n");
+	}
+
+    s->sockfd = sockfd;
+    s->servinfo = p;
+    s->host = NULL;
+    s->port = port;
+
+}
+
+
+void attach_socket(char *host, char *port, struct sock* s) {
     
     int sockfd;
 	struct addrinfo hints, *servinfo, *p;
@@ -48,14 +185,7 @@ void bind_socket(char *host, char *port, struct sock* s) {
 				p->ai_protocol)) == -1) {
 			perror("peer: socket");
 			continue;
-		}
-
-		if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-			close(sockfd);
-			perror("peer: bind");
-			continue;
-		}
-
+        }
 		break;
 	}
 
@@ -70,36 +200,9 @@ void bind_socket(char *host, char *port, struct sock* s) {
 
 }
 
-void get_hosts(char *file, char ** hosts, char *host) {
+struct sock * getsock(struct sock **sockets, int sockfd, int n) {
 
-    FILE *fp;
-    char *line = NULL;
-    size_t line_size, n_chars;
-    int i = 0;
-
-    fp = fopen(file, "r");
-
-    while ((n_chars = getline(&line, &line_size, fp)) != -1) {
-        fprintf(stderr, "Host name: %s", line);
-        line[line_size-1] = '\0';
-        if (strcmp(line, host) != 0) { // No need to send heartbeats to running host
-            hosts[i] = malloc(line_size * sizeof(char));
-            memset(hosts[i], 0, line_size);
-            hosts[i] = line;
-            i += 1;
-        }
-    }
-
-    fclose(fp);
-
-    if (line)
-        free(line);
-
-}
-
-struct sock * getsock(struct sock **sockets, int sockfd) {
-
-    for (int i = 0; i < MAX_NO_HOSTS; i++) {
+    for (int i = 0; i < n; i++) {
         if (sockets[i]->sockfd == sockfd)
             return sockets[i];
     }
@@ -108,151 +211,114 @@ struct sock * getsock(struct sock **sockets, int sockfd) {
 
 }
 
-int getindex(struct sock **sockets, struct sock* socket) {
-
-    for (int i = 0; i < MAX_NO_HOSTS; i++) {
-        if (strcmp(sockets[i]->servinfo->ai_addr->sa_data, socket->servinfo->ai_addr->sa_data) == 0)
-            return i;
-    }
-
-    return -1;
-
-}
-
-int getpfdsindex(struct pollfd *pfds, int fd_count, int sockfd) {
-
-    for (int i = 0; i < fd_count; i++) {
-        if (pfds[i].fd == sockfd)
-            return i;
-    }
-
-    return -1;
-
-}
-
-// Remove an index from the set
-// void del_from_pfds(struct pollfd pfds[], int i, int *fd_count)
-// {
-//     // Copy the one from the end over this one
-//     pfds[i] = pfds[*fd_count-1];
-//     (*fd_count)--;
-// }
 
 int main(int argc, char *argv[]) {
 
-    char ** hosts = malloc(MAX_NO_HOSTS * sizeof(char *));
-    int fd_count = 2 * MAX_NO_HOSTS + 2;
-    struct pollfd *pfds = malloc(sizeof *pfds * fd_count);
-    char ack_msg[] = "ACK";
-    char beat_msg[] = "I AM ALIVE!";
-    int ack_count=0, recv_count=0;
-    int n = MAX_NO_HOSTS;
-    bool rack[MAX_NO_HOSTS] = {false};
+    char **hosts = malloc((MAX_NO_HOSTS-1) * sizeof(char *));
+    int n = 0;
+
+    get_hosts(argv[2], hosts, &n);
+    // printf("n: %d\n", n);
+
+    fd_set read_fds;
+    fd_set write_fds;
+    int max_fd = -1;
+    struct sock *read_socket = malloc(sizeof(struct sock));
+    struct sock **write_sockets = malloc(sizeof(struct sock *) * n);
+    char beat_msg[] = "I AM ALIVE";
     bool rbeat[MAX_NO_HOSTS] = {false};
 
-    get_hosts(argv[1], hosts, argv[2]);
-
-    struct sock **sbeat_sockets = malloc(sizeof(struct sock *) * MAX_NO_HOSTS); 
-    struct sock **sack_sockets = malloc(sizeof(struct sock *) * MAX_NO_HOSTS); 
+    FD_ZERO(&read_fds);
+    FD_ZERO(&write_fds);
     
-    for (int i = 0; i < MAX_NO_HOSTS; i++) {
-        sbeat_sockets[i] = malloc(sizeof(struct sock));
-        bind_socket(hosts[i], BEAT_PORT, sbeat_sockets[i]);
-        pfds[i].fd = sbeat_sockets[i]->sockfd;
-        pfds[i].events = POLL_OUT;
+    bind_socket("8080", read_socket);
+    int read_fd = read_socket->sockfd;
+    FD_SET(read_fd, &read_fds);
+
+    max_fd = max(max_fd, read_fd);
+
+    for (int i = 0; i < n; i++) {
+        write_sockets[i] = malloc(sizeof(struct sock));
+        attach_socket(hosts[i], "8080", write_sockets[i]);
+        int write_fd = write_sockets[i]->sockfd;
+        max_fd = max(max_fd, write_fd);
+        FD_SET(write_fd, &write_fds);
     }
 
-    for (int i = MAX_NO_HOSTS; i < 2 * MAX_NO_HOSTS; i++) {
-        sack_sockets[i-MAX_NO_HOSTS] = malloc(sizeof(struct sock));
-        bind_socket(hosts[i-MAX_NO_HOSTS], ACK_PORT, sack_sockets[i-MAX_NO_HOSTS]);
-        pfds[i].fd = sack_sockets[i-MAX_NO_HOSTS]->sockfd;
-        pfds[i].events = POLL_OUT;
-    }
+    int recv_count = 0;
 
-    struct sock *rbeat_socket = malloc(sizeof(struct sock));
-    bind_socket(NULL, BEAT_PORT, rbeat_socket);
-    pfds[2*MAX_NO_HOSTS].fd = rbeat_socket->sockfd;
-    pfds[2*MAX_NO_HOSTS].events = POLL_IN;
+    fd_set t_read_fds;
+    fd_set t_write_fds;
 
-    struct sock *rack_socket = malloc(sizeof(struct sock));
-    bind_socket(NULL, ACK_PORT, rack_socket);
-    pfds[2*MAX_NO_HOSTS+1].fd = rack_socket->sockfd;
-    pfds[2*MAX_NO_HOSTS+1].events = POLL_IN;
+    int count = 0;
 
     for (;;) {
 
-        if (recv_count == n-1 && ack_count == n-1) {
-            // Free all resources
+        if (recv_count == n)
             break;
+
+        t_read_fds = read_fds;
+        t_write_fds = write_fds;
+
+        if (select(max_fd+1, &t_read_fds, &t_write_fds, NULL, NULL) == -1) {
+            perror("select");
+            exit(4);
         }
 
-        int poll_count = poll(pfds, fd_count, -1);
+        for(int i = 0; i <= max_fd; i++) {
 
-        if (poll_count == -1) {
-            perror("poll");
-            exit(1);
-        }
+            // printf("%d\n", i);
 
-        // Run through the existing connections looking for data to read
-        for(int i = 0; i < fd_count; i++) {
+            if (FD_ISSET(i, &t_read_fds)) {
 
-            if (pfds[i].revents & POLLIN) { // Receive data
-
-                if (pfds[i].fd == rack_socket->sockfd) { // Received ack
-
-                    int index = getindex(sack_sockets, rack_socket);
-                    if (!rack[index]) {
-                        fprintf(stderr, "Received acknowledgement from %s\n", hosts[index]);
-                        rack[index] = true;
-                        ack_count++;
+                if (i == read_fd) { // Read
+                    struct sockaddr_storage their_addr;
+                    int numbytes;
+                    char buf[MAXBUFLEN];
+                    socklen_t addr_len = sizeof their_addr;
+                    char s[INET_ADDRSTRLEN];
+                    
+                    if ((numbytes = recvfrom(read_fd, buf, MAXBUFLEN-1 , 0,
+                        (struct sockaddr *)&their_addr, &addr_len)) == -1) {
+                        perror("recvfrom");
+                        exit(1);
                     }
-                    
-                    // Remove the send socket
-                    // index = getpfdsindex(pfds, fd_count, sbeat_sockets[index]->sockfd);
-                    // del_from_pfds(pfds, index, &fd_count);
 
-                } else if (pfds[i].fd == rbeat_socket->sockfd) { // Received heartbeat
-                    
-                    int index = getindex(sbeat_sockets, rbeat_socket);
-                    if (!rbeat[index]) {
-                        fprintf(stderr, "Received heartbeat from %s\n", hosts[index]);
-                        rbeat[index] = true;
+                    // printf("peer: got packet from %s\n",
+                    // inet_ntop(their_addr.ss_family,
+                        // get_in_addr((struct sockaddr *)&their_addr),
+                        // s, sizeof s));
+                    // printf("peer: packet is %d bytes long\n", numbytes);
+                    buf[numbytes] = '\0';
+                    // printf("peer: packet contains \"%s\"\n", buf); 
+
+                    int p = get_index(write_sockets, n, &their_addr);
+                    // printf("Index: %d\n", p);
+
+                    if (!rbeat[p]) {
                         recv_count++;
+                        printf("peer: got packet from %s\n", write_sockets[p]->host);
+                        rbeat[p] = true;
                     }
 
-                }
+                } 
 
-            } else if (pfds[i].revents & POLLOUT) { // Send data
-
-                struct sock *sbeat_socket = getsock(sbeat_sockets, pfds[i].fd);
-                
-                if (sbeat_socket != NULL) { // Send heartbeat
-
-                    if (sendto(sbeat_socket->sockfd, beat_msg, strlen(beat_msg), 0, sbeat_socket->servinfo->ai_addr, sbeat_socket->servinfo->ai_addrlen) == -1) {
+                } 
+                else if (FD_ISSET(i, &t_write_fds)) {
+                    
+                    struct sock *write_socket = getsock(write_sockets, i, n);
+                    
+                    if (sendto(write_socket->sockfd, 
+                        beat_msg, strlen(beat_msg), 
+                        0, 
+                        write_socket->servinfo->ai_addr, 
+                        write_socket->servinfo->ai_addrlen) == -1) {
                         perror("peer: sendto");
                     }
-
-                } else{ // Send ack
-
-                    struct sock *sack_socket = getsock(sack_sockets, pfds[i].fd);
-                    int index = getindex(sack_sockets, sack_socket);
-                     
-                    if (rbeat[index]) {
-                        fprintf(stderr, "Sending acknowledgement to %s\n", hosts[index]);
-                        if (sendto(sack_socket->sockfd, ack_msg, strlen(ack_msg), 0, sack_socket->servinfo->ai_addr, sack_socket->servinfo->ai_addrlen) == -1) {
-                            perror("peer: sendto");
-                        } 
-                        // else {
-                        //     del_from_pfds(pfds, i, &fd_count);
-                        // }
-                    }
-
                 }
 
             }
-
         }
 
     }
 
-}
