@@ -8,3 +8,5 @@ COPY peer.c .
 COPY hostsfile.txt .
 
 RUN gcc peer.c -o peer
+
+ENTRYPOINT [ "./peer" ]
