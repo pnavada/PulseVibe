@@ -1,6 +1,6 @@
 FROM ubuntu:22.04
 
-RUN apt-get update && apt install -y build-essential && apt-get install -y iputils-ping
+RUN apt-get update && apt install -y build-essential
 
 WORKDIR /home/ubuntu
 
